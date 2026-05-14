@@ -1,0 +1,49 @@
+# Python/cache
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Environments
+.venv/
+venv/
+env/
+
+# Data and generated reports
+*.json
+*.jsonl
+*.csv
+*.tsv
+*.parquet
+*.arrow
+*.pkl
+*.pickle
+
+# Project-generated artifacts
+data/raw/
+data/processed/
+data/cold_start/
+outputs/
+ablation/output/
+
+# Model checkpoints and large tensor files
+checkpoint-*/
+*.bin
+*.safetensors
+*.pt
+*.pth
+*.ckpt
+*.onnx
+
+# Logs
+*.log
+wandb/
+runs/
+tensorboard/
+
+# Local editor/OS noise
+.DS_Store
+.vscode/

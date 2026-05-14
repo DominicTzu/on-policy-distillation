@@ -19,6 +19,14 @@ For a debug run, edit `LIMIT` in `data/prepare_data.py`.
 
 ## 2. Generate Teacher Long CoT
 
+Recommended vLLM version:
+
+```bash
+python data/generate_teacher_cold_start_vllm.py
+```
+
+Baseline Transformers version:
+
 ```bash
 python data/generate_teacher_cold_start.py
 ```
@@ -56,6 +64,15 @@ data/cold_start/teacher_long_gsm8k_train.difficulty.jsonl
 
 ## 5. Compress Teacher Rationales
 按difficulty压缩long rationale
+
+Recommended vLLM version:
+
+```bash
+python data/compress_teacher_rationales_vllm.py
+```
+
+Baseline Transformers version:
+
 ```bash
 python data/compress_teacher_rationales.py
 ```

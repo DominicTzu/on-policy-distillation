@@ -28,7 +28,6 @@ from train_utils import (
     build_eval_metric_schema,
     build_prompt,
     ensure_pad_token,
-    get_device,
     get_model_input_device,
     get_torch_dtype,
     load_latest_checkpoint,
@@ -68,24 +67,93 @@ MAX_GRAD_NORM = 1.0
 LOG_EVERY_STEPS = 10
 
 TEMPERATURE = 2.0
-ALPHA_CE = 0.5
-BETA_KD = 1.0
+ALPHA_CE = 1.0
+BETA_KD = 0.1
+EXCLUDE_EOS_FROM_KD = True
+
+# Conservative default after the first run regressed accuracy: train on reliable
+# on-policy states first, then relax these filters in ablations.
+TRAIN_ONLY_CORRECT_ROLLOUTS = True
+TRAIN_ONLY_FORMAT_VALID_ROLLOUTS = True
+MAX_ROLLOUT_RESPONSE_TOKENS = 96
+MAX_ROLLOUT_RATIONALE_TOKENS = 80
 
 STUDENT_TORCH_DTYPE = "auto"  # auto, float16, bfloat16, float32
 TEACHER_TORCH_DTYPE = "auto"
+
+# With two GPUs, keep trainable student and frozen teacher on separate cards.
+# Set both to "cuda:0" only if you explicitly want single-GPU debugging.
+STUDENT_DEVICE = "cuda:0"
+TEACHER_DEVICE = "cuda:1"
+ENABLE_GRADIENT_CHECKPOINTING = True
+
+
+def normalize_device_for_dtype(device):
+    device = str(device)
+    if device.startswith("cuda"):
+        return "cuda"
+    return device
+
+
+def normalize_device_for_autocast(device):
+    device = str(device)
+    if device.startswith("cuda"):
+        return "cuda"
+    return device
+
+
+def resolve_device(requested_device):
+    if requested_device.startswith("cuda") and not torch.cuda.is_available():
+        return "cpu"
+    if requested_device.startswith("cuda:"):
+        index = int(requested_device.split(":", 1)[1])
+        if torch.cuda.device_count() <= index:
+            raise ValueError(
+                f"Requested {requested_device}, but only "
+                f"{torch.cuda.device_count()} CUDA device(s) are visible."
+            )
+    return requested_device
 
 
 class OnPolicyRolloutDataset(Dataset):
     def __init__(self, records, tokenizer, max_length):
         self.examples = []
         self.skipped_no_response_tokens = 0
+        self.skipped_incorrect = 0
+        self.skipped_format_invalid = 0
+        self.skipped_too_long = 0
 
         for idx, record in enumerate(records):
+            skip_reason = self.get_skip_reason(record)
+            if skip_reason is not None:
+                if skip_reason == "incorrect":
+                    self.skipped_incorrect += 1
+                elif skip_reason == "format_invalid":
+                    self.skipped_format_invalid += 1
+                elif skip_reason == "too_long":
+                    self.skipped_too_long += 1
+                continue
+
             example = self.build_example(record, tokenizer, max_length, idx)
             if example is None:
                 self.skipped_no_response_tokens += 1
             else:
                 self.examples.append(example)
+
+    def get_skip_reason(self, record):
+        if TRAIN_ONLY_CORRECT_ROLLOUTS and not record.get("student_correct"):
+            return "incorrect"
+        if TRAIN_ONLY_FORMAT_VALID_ROLLOUTS and record.get(
+            "student_missing_required_sections"
+        ):
+            return "format_invalid"
+        if MAX_ROLLOUT_RESPONSE_TOKENS is not None:
+            if record.get("student_response_tokens", 0) > MAX_ROLLOUT_RESPONSE_TOKENS:
+                return "too_long"
+        if MAX_ROLLOUT_RATIONALE_TOKENS is not None:
+            if record.get("student_rationale_tokens", 0) > MAX_ROLLOUT_RATIONALE_TOKENS:
+                return "too_long"
+        return None
 
     def build_example(self, record, tokenizer, max_length, idx):
         prompt = build_prompt(record)
@@ -148,7 +216,13 @@ def load_student(checkpoint, tokenizer, dtype, device):
         torch_dtype=dtype,
         trust_remote_code=True,
     )
-    model.resize_token_embeddings(len(tokenizer))
+    embedding_size = model.get_input_embeddings().num_embeddings
+    if len(tokenizer) > embedding_size:
+        model.resize_token_embeddings(len(tokenizer))
+    if ENABLE_GRADIENT_CHECKPOINTING:
+        model.gradient_checkpointing_enable()
+        if hasattr(model.config, "use_cache"):
+            model.config.use_cache = False
     model.to(device)
     return model
 
@@ -185,6 +259,13 @@ def save_stage_b_manifest(
             "alpha_ce": ALPHA_CE,
             "beta_kd": BETA_KD,
             "formula": "alpha_ce * CE + beta_kd * T^2 * KL(teacher || student)",
+            "exclude_eos_from_kd": EXCLUDE_EOS_FROM_KD,
+        },
+        "rollout_filters": {
+            "train_only_correct_rollouts": TRAIN_ONLY_CORRECT_ROLLOUTS,
+            "train_only_format_valid_rollouts": TRAIN_ONLY_FORMAT_VALID_ROLLOUTS,
+            "max_rollout_response_tokens": MAX_ROLLOUT_RESPONSE_TOKENS,
+            "max_rollout_rationale_tokens": MAX_ROLLOUT_RATIONALE_TOKENS,
         },
         "rollout_metrics": rollout_metrics,
         "train_state_file": str(OUTPUT_DIR / "stage_b_train_state.json"),
@@ -219,9 +300,14 @@ def main():
             "Run stage_B/generate_student_rollouts.py first."
         )
 
-    device = get_device()
-    student_dtype = get_torch_dtype(device, STUDENT_TORCH_DTYPE)
-    teacher_dtype = get_torch_dtype(device, TEACHER_TORCH_DTYPE)
+    student_device = resolve_device(STUDENT_DEVICE)
+    teacher_device = resolve_device(TEACHER_DEVICE)
+    student_dtype = get_torch_dtype(
+        normalize_device_for_dtype(student_device), STUDENT_TORCH_DTYPE
+    )
+    teacher_dtype = get_torch_dtype(
+        normalize_device_for_dtype(teacher_device), TEACHER_TORCH_DTYPE
+    )
 
     tokenizer = AutoTokenizer.from_pretrained(
         cold_start_checkpoint, trust_remote_code=True
@@ -231,6 +317,14 @@ def main():
     dataset = OnPolicyRolloutDataset(records, tokenizer, MAX_LENGTH)
     if len(dataset) == 0:
         raise ValueError("No rollout examples have response tokens after truncation.")
+    print(
+        "Stage B rollout filter: "
+        f"kept={len(dataset)} total={len(records)} "
+        f"incorrect={dataset.skipped_incorrect} "
+        f"format_invalid={dataset.skipped_format_invalid} "
+        f"too_long={dataset.skipped_too_long} "
+        f"no_response_tokens={dataset.skipped_no_response_tokens}"
+    )
 
     dataloader = DataLoader(
         dataset,
@@ -239,9 +333,20 @@ def main():
         collate_fn=lambda batch: collate_batch(batch, tokenizer),
     )
 
-    student = load_student(cold_start_checkpoint, tokenizer, student_dtype, device)
-    teacher = load_teacher(teacher_dtype, device)
+    student = load_student(
+        cold_start_checkpoint, tokenizer, student_dtype, student_device
+    )
+    teacher = load_teacher(teacher_dtype, teacher_device)
     student.train()
+    student_vocab_size = student.get_output_embeddings().weight.shape[0]
+    teacher_vocab_size = teacher.get_output_embeddings().weight.shape[0]
+    shared_kd_vocab_size = min(student_vocab_size, teacher_vocab_size)
+    if student_vocab_size != teacher_vocab_size:
+        print(
+            "Using shared vocab for KD: "
+            f"student={student_vocab_size} teacher={teacher_vocab_size} "
+            f"shared={shared_kd_vocab_size}"
+        )
 
     total_update_steps = math.ceil(
         len(dataloader) * NUM_EPOCHS / GRADIENT_ACCUMULATION_STEPS
@@ -259,8 +364,8 @@ def main():
         num_training_steps=total_update_steps,
     )
 
-    use_bf16 = device == "cuda" and student_dtype == torch.bfloat16
-    use_fp16 = device == "cuda" and student_dtype == torch.float16
+    use_bf16 = str(student_device).startswith("cuda") and student_dtype == torch.bfloat16
+    use_fp16 = str(student_device).startswith("cuda") and student_dtype == torch.float16
     scaler = torch.cuda.amp.GradScaler(enabled=use_fp16)
 
     total_losses = []
@@ -299,17 +404,18 @@ def main():
                 teacher_outputs = teacher(**teacher_batch)
 
             with torch.autocast(
-                device_type=device,
+                device_type=normalize_device_for_autocast(student_device),
                 dtype=student_dtype,
                 enabled=use_bf16 or use_fp16,
             ):
                 student_outputs = student(**student_batch)
-                teacher_logits = teacher_outputs.logits.to(student_outputs.logits.device)
                 ce_loss, kd_loss = distillation_losses(
                     student_outputs.logits,
-                    teacher_logits,
+                    teacher_outputs.logits,
                     labels,
                     TEMPERATURE,
+                    eos_token_id=tokenizer.eos_token_id,
+                    exclude_eos_from_kd=EXCLUDE_EOS_FROM_KD,
                 )
                 total_loss = ALPHA_CE * ce_loss + BETA_KD * kd_loss
                 loss_for_backward = total_loss / accumulation_size
@@ -362,6 +468,12 @@ def main():
         "output_dir": str(OUTPUT_DIR),
         "cold_start_checkpoint": str(cold_start_checkpoint),
         "teacher_model": TEACHER_MODEL,
+        "student_device": student_device,
+        "teacher_device": teacher_device,
+        "gradient_checkpointing": ENABLE_GRADIENT_CHECKPOINTING,
+        "student_vocab_size": student_vocab_size,
+        "teacher_vocab_size": teacher_vocab_size,
+        "shared_kd_vocab_size": shared_kd_vocab_size,
         "num_rollouts": len(records),
         "num_train_examples": len(dataset),
         "skipped_no_response_tokens": dataset.skipped_no_response_tokens,
@@ -373,7 +485,15 @@ def main():
         "temperature": TEMPERATURE,
         "alpha_ce": ALPHA_CE,
         "beta_kd": BETA_KD,
+        "exclude_eos_from_kd": EXCLUDE_EOS_FROM_KD,
+        "train_only_correct_rollouts": TRAIN_ONLY_CORRECT_ROLLOUTS,
+        "train_only_format_valid_rollouts": TRAIN_ONLY_FORMAT_VALID_ROLLOUTS,
+        "max_rollout_response_tokens": MAX_ROLLOUT_RESPONSE_TOKENS,
+        "max_rollout_rationale_tokens": MAX_ROLLOUT_RATIONALE_TOKENS,
         "train_steps": update_step,
+        "skipped_incorrect": dataset.skipped_incorrect,
+        "skipped_format_invalid": dataset.skipped_format_invalid,
+        "skipped_too_long": dataset.skipped_too_long,
         "avg_total_loss": sum(total_losses) / len(total_losses)
         if total_losses
         else None,

@@ -10,6 +10,14 @@ data/cold_start/cold_start_gsm8k_train.jsonl
 
 ## 1. Generate Student Rollouts
 
+Recommended vLLM version:
+
+```bash
+python stage_B/generate_student_rollouts_vllm.py
+```
+
+Baseline Transformers version:
+
 ```bash
 python stage_B/generate_student_rollouts.py
 ```
@@ -98,5 +106,6 @@ loss = alpha_ce * CE + beta_kd * T^2 * KL(teacher || student)
 ```
 
 Change hyperparameters by editing constants at the top of
-`stage_B/generate_student_rollouts.py` and
+`stage_B/generate_student_rollouts_vllm.py`,
+`stage_B/generate_student_rollouts.py`, and
 `stage_B/train_on_policy_logits_kd.py`.
